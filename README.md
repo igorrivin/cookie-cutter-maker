@@ -1,17 +1,39 @@
+---
+title: Cookie Cutter Maker
+emoji: 🍪
+colorFrom: orange
+colorTo: yellow
+sdk: gradio
+sdk_version: 4.44.0
+app_file: app.py
+pinned: false
+license: mit
+---
+
 # Cookie Cutter Maker
 
-Turn any image into a 3D-printable cookie cutter!
+Turn any image into a 3D-printable cookie cutter or cylinder seal!
 
-A simple web app that converts 2D images (silhouettes, logos, characters) into STL files ready for 3D printing.
+A web app that converts 2D images into STL files ready for 3D printing.
 
 ## Features
 
-- **Easy to use**: Just upload an image and adjust a few sliders
-- **3D Preview**: See your cookie cutter in 3D before downloading
-- **Customizable**: Adjust size, wall height, and thickness
-- **Instant STL download**: Get a print-ready file in seconds
+### Relief Embossing
+- Creates cookie stamps with embossed designs from image brightness
+- Light areas = raised, dark areas = recessed (or invert)
+- Best for photos, characters, logos
 
-## Installation
+### Outline Only
+- Generates cookie cutters from silhouettes
+- Creates just the cutting edge shape
+- Best for simple shapes (stars, hearts, gingerbread men)
+
+### Cylinder Seals
+- Creates rollable stamps like ancient Sumerian seals
+- Image wraps around a hollow cylinder
+- Roll to imprint repeating patterns
+
+## Installation (Local)
 
 ```bash
 # Clone the repo
@@ -29,54 +51,68 @@ Then open http://localhost:7860 in your browser.
 
 ## Usage
 
-1. **Upload an image** - PNG with transparent background works best
-2. **Adjust settings**:
-   - Cookie Size: The maximum width/height in mm
-   - Wall Height: How tall the cutting edge is (10-20mm typical)
-   - Wall Thickness: Thickness of walls (1.2mm works well)
-3. **Generate** - Click the button to create your cutter
-4. **Download STL** - Save the file for 3D printing
+1. **Choose a mode**: Relief Embossing, Outline Only, or Cylinder Seal
+2. **Upload an image**: PNG, JPG, or images with transparent backgrounds
+3. **Adjust settings**: Size, depth, resolution, etc.
+4. **Generate**: Click the button to create your model
+5. **Download STL**: Save the file for 3D printing
 
 ## Tips for Best Results
 
 ### Image Selection
-- Use images with **clear, simple shapes**
-- **Silhouettes** work better than detailed photos
-- PNG files with **transparent backgrounds** are ideal
-- Avoid very thin lines or intricate details
+- **Relief Embossing**: Works with any image - photos, logos, characters
+- **Outline Only**: Use simple silhouettes with clear edges
+- **Cylinder Seals**: Patterns that tile horizontally work best
 
 ### 3D Printing
 - Use **food-safe filament** (PLA, PETG) if using with actual food
 - Print with **0.2mm layer height** for good detail
 - **100% infill** makes the cutter more durable
-- Consider printing a separate handle piece
+- Cylinder seals: print standing up for best surface finish
 
 ## How It Works
 
-1. The image is converted to a binary mask (silhouette)
-2. Contours are extracted and simplified
-3. The contour is extruded into 3D walls
-4. Inner and outer walls create the cutting edge
-5. A manifold mesh is generated and exported as STL/GLB
+### Relief Embossing
+1. Image converted to grayscale heightmap
+2. Brightness mapped to surface height
+3. Circular disc with rim created
+4. Exported as watertight mesh
+
+### Outline Only
+1. Image converted to binary mask
+2. Contours extracted and simplified
+3. Extruded into 3D walls with cutting edge
+4. Exported as manifold mesh
+
+### Cylinder Seals
+1. Image wrapped around cylinder coordinates
+2. Brightness displaces outer surface
+3. Inner surface maintains wall thickness
+4. Top/bottom rims stitched for watertight mesh
 
 ## Command Line Usage
 
-You can also use the generator directly from Python:
-
 ```python
-from cookie_cutter import generate_cookie_cutter
+from cookie_cutter import generate_relief_cookie_cutter, generate_cylinder_seal
 import cv2
 
-image = cv2.imread("my_shape.png", cv2.IMREAD_UNCHANGED)
-model_path, preview, stats = generate_cookie_cutter(
+# Relief cookie cutter
+image = cv2.imread("my_image.png")
+model_path, preview, stats = generate_relief_cookie_cutter(
     image=image,
-    wall_height=15.0,
-    wall_thickness=1.2,
-    cutter_size=80,
+    diameter_mm=80,
+    relief_depth=2.0,
     output_format="stl"
 )
-print(f"Generated: {model_path}")
-print(stats)
+
+# Cylinder seal
+model_path, preview, stats = generate_cylinder_seal(
+    image=image,
+    outer_radius=20,
+    height=60,
+    max_displacement=2.0,
+    output_format="stl"
+)
 ```
 
 ## Requirements
@@ -84,6 +120,7 @@ print(stats)
 - Python 3.8+
 - OpenCV
 - NumPy
+- SciPy
 - Gradio
 - Pillow
 
@@ -93,4 +130,4 @@ MIT License - feel free to use, modify, and share!
 
 ## Acknowledgments
 
-Inspired by the creativity of cookie makers everywhere who turn their favorite characters and shapes into delicious treats.
+Inspired by cookie makers everywhere and ancient Sumerian scribes who rolled their stories into clay.
