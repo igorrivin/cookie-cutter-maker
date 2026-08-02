@@ -7,6 +7,7 @@ Turn any image into a 3D-printable cookie cutter!
 import gradio as gr
 import numpy as np
 from pathlib import Path
+from PIL import Image
 import tempfile
 import os
 import cv2
@@ -211,7 +212,7 @@ def process_cylinder_seal(
 - Height: {stats['height_mm']} mm
 - Circumference: {stats['circumference_mm']} mm
 - Max Displacement: {stats['max_displacement_mm']} mm
-- Resolution: {stats['resolution']}
+- Resolution: {stats['resolution']} (requested: {resolution})
 - Constant Wall: {"Yes" if stats['constant_wall'] else "No"}
 - Mesh: {stats['vertices']} vertices, {stats['faces']} faces
 
@@ -259,6 +260,13 @@ def download_cylinder_stl(
 
 # Example images
 EXAMPLES_DIR = Path(__file__).parent / "examples"
+EXAMPLE_PATHS = sorted(EXAMPLES_DIR.glob("*.png")) + sorted(EXAMPLES_DIR.glob("*.jpg"))
+EXAMPLE_GALLERY_ITEMS = [(str(p), p.stem) for p in EXAMPLE_PATHS]
+
+
+def _load_example(evt: gr.SelectData):
+    """Load a clicked example thumbnail as numpy array."""
+    return np.array(Image.open(EXAMPLE_PATHS[evt.index]))
 
 
 def create_app():
@@ -266,11 +274,6 @@ def create_app():
 
     with gr.Blocks(
         title="Cookie Cutter Maker",
-        theme=gr.themes.Soft(primary_hue="orange"),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        """
     ) as app:
 
         gr.Markdown(
@@ -298,8 +301,7 @@ def create_app():
                             label="Upload your image (click or drag & drop)",
                             type="numpy",
                             sources=["upload"],
-                            height=250,
-                            show_download_button=False
+                            height=250
                         )
 
                         gr.Markdown("### 2. Adjust Settings")
@@ -395,6 +397,15 @@ def create_app():
                             visible=True
                         )
 
+                if EXAMPLE_GALLERY_ITEMS:
+                    gr.Markdown("### Example Images")
+                    relief_gallery = gr.Gallery(
+                        value=EXAMPLE_GALLERY_ITEMS,
+                        columns=4, height=100, object_fit="contain",
+                        allow_preview=False, show_label=False,
+                    )
+                    relief_gallery.select(fn=_load_example, outputs=[relief_image])
+
             # Tab 2: Contour-based (for simple shapes)
             with gr.TabItem("Outline Only", id="contour"):
                 gr.Markdown(
@@ -410,8 +421,7 @@ def create_app():
                             label="Upload your image (click or drag & drop)",
                             type="numpy",
                             sources=["upload"],
-                            height=250,
-                            show_download_button=False
+                            height=250
                         )
 
                         gr.Markdown("### 2. Adjust Settings")
@@ -498,6 +508,15 @@ def create_app():
                             visible=True
                         )
 
+                if EXAMPLE_GALLERY_ITEMS:
+                    gr.Markdown("### Example Images")
+                    contour_gallery = gr.Gallery(
+                        value=EXAMPLE_GALLERY_ITEMS,
+                        columns=4, height=100, object_fit="contain",
+                        allow_preview=False, show_label=False,
+                    )
+                    contour_gallery.select(fn=_load_example, outputs=[contour_image])
+
             # Tab 3: Cylinder Seals
             with gr.TabItem("Cylinder Seal", id="cylinder"):
                 gr.Markdown(
@@ -514,8 +533,7 @@ def create_app():
                             label="Upload your image (click or drag & drop)",
                             type="numpy",
                             sources=["upload"],
-                            height=250,
-                            show_download_button=False
+                            height=250
                         )
 
                         gr.Markdown("### 2. Adjust Settings")
@@ -618,16 +636,14 @@ def create_app():
                             visible=True
                         )
 
-        # Examples section
-        if EXAMPLES_DIR.exists():
-            example_files = list(EXAMPLES_DIR.glob("*.png")) + list(EXAMPLES_DIR.glob("*.jpg"))
-            if example_files:
-                gr.Markdown("### Example Images")
-                gr.Examples(
-                    examples=[[str(f)] for f in example_files[:4]],
-                    inputs=[relief_image],
-                    label="Click an example to try it"
-                )
+                if EXAMPLE_GALLERY_ITEMS:
+                    gr.Markdown("### Example Images")
+                    cylinder_gallery = gr.Gallery(
+                        value=EXAMPLE_GALLERY_ITEMS,
+                        columns=4, height=100, object_fit="contain",
+                        allow_preview=False, show_label=False,
+                    )
+                    cylinder_gallery.select(fn=_load_example, outputs=[cylinder_image])
 
         gr.Markdown(
             """
@@ -694,8 +710,13 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
     app.launch(
-        share=False,
+        share=True,
         server_name="0.0.0.0",
         server_port=7860,
-        show_error=True
+        show_error=True,
+        theme=gr.themes.Soft(primary_hue="orange"),
+        css="""
+        .main-title { text-align: center; margin-bottom: 0; }
+        .subtitle { text-align: center; color: #666; margin-top: 0; }
+        """
     )

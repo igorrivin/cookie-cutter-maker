@@ -10,6 +10,128 @@ from pathlib import Path
 from typing import Tuple, Optional
 import tempfile
 from scipy.ndimage import gaussian_filter
+from scipy.interpolate import splprep, splev
+
+# DNN super-resolution for upscaling small input images
+_sr_model = None
+_SR_MODEL_PATH = Path(__file__).parent / "models" / "ESPCN_x4.pb"
+
+
+def _get_upscaler():
+    """Lazy-load the 4x ESPCN super-resolution model."""
+    global _sr_model
+    if _sr_model is None and _SR_MODEL_PATH.exists():
+        _sr_model = cv2.dnn_superres.DnnSuperResImpl_create()
+        _sr_model.readModel(str(_SR_MODEL_PATH))
+        _sr_model.setModel("espcn", 4)
+    return _sr_model
+
+
+def upscale_image(image: np.ndarray, target_min_size: int = 1024) -> np.ndarray:
+    """Upscale image using DNN super-resolution if it's too small.
+
+    Only upscales if the larger dimension is below target_min_size.
+    Falls back to LANCZOS4 interpolation if the model isn't available.
+    """
+    h, w = image.shape[:2]
+    if max(h, w) >= target_min_size:
+        return image
+
+    sr = _get_upscaler()
+    if sr is not None:
+        # ESPCN needs 3-channel input
+        if len(image.shape) == 2:
+            image_3ch = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif image.shape[2] == 4:
+            image_3ch = cv2.cvtColor(image[:, :, :3], cv2.COLOR_RGB2BGR)
+        else:
+            image_3ch = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        upscaled = sr.upsample(image_3ch)
+        return cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+
+    # Fallback: plain LANCZOS4
+    scale = target_min_size / max(h, w)
+    new_w, new_h = int(w * scale), int(h * scale)
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+
+def _vectorize_heightmap(heightmap: np.ndarray, smoothing: float = 1.0) -> np.ndarray:
+    """Convert a binary/near-binary heightmap to one with smooth beveled edges.
+
+    Combines two techniques:
+    1. Vector smoothing: extract contours, fit splines → smooth edge GEOMETRY
+    2. Distance field on smooth contours → smooth height TRANSITION (bevel)
+
+    The SDF is computed at 8x resolution on the spline-smoothed contours,
+    then downsampled. This gives sub-pixel accurate smooth distance values
+    that follow curves, not pixel grid lines.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    h, w = heightmap.shape
+    binary = (heightmap > 0.5).astype(np.uint8) * 255
+
+    contours, hierarchy = cv2.findContours(
+        binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return heightmap
+
+    # Separate external contours from holes
+    externals = []
+    holes = []
+    for i, contour in enumerate(contours):
+        pts = contour.reshape(-1, 2).astype(float)
+        is_hole = hierarchy[0][i][3] != -1 if hierarchy is not None else False
+        if is_hole:
+            holes.append(pts)
+        else:
+            externals.append(pts)
+
+    def _smooth_contour(pts):
+        """Fit a periodic cubic spline and resample densely."""
+        if len(pts) < 10:
+            return pts
+        tck, _ = splprep(
+            [pts[:, 0], pts[:, 1]],
+            s=len(pts) * smoothing,
+            per=True,
+        )
+        u_new = np.linspace(0, 1, max(len(pts) * 4, 500), endpoint=False)
+        x_new, y_new = splev(u_new, tck)
+        return np.column_stack([x_new, y_new])
+
+    # Render smooth contours at 8x resolution
+    scale = 8
+    canvas = np.zeros((h * scale, w * scale), dtype=np.uint8)
+
+    for pts in externals:
+        smooth = _smooth_contour(pts)
+        scaled = (smooth * scale).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(canvas, [scaled], 255)
+
+    for pts in holes:
+        smooth = _smooth_contour(pts)
+        scaled = (smooth * scale).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(canvas, [scaled], 0)
+
+    # Compute signed distance field at high resolution on smooth contours
+    inside = canvas > 127
+    dist_inside = distance_transform_edt(inside).astype(np.float32)
+    dist_outside = distance_transform_edt(~inside).astype(np.float32)
+    sdf_hires = dist_inside - dist_outside
+
+    # Downsample the smooth distance field to mesh resolution
+    sdf = cv2.resize(sdf_hires, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Sigmoid transition width proportional to image width so the bevel
+    # is a consistent physical size regardless of mesh resolution
+    # (~2% of width = ~2.5mm on a 125mm circumference cylinder)
+    transition_width = smoothing * 0.02 * w * scale
+    transition_width = max(transition_width, 2.0 * scale)
+    return 1.0 / (1.0 + np.exp(-sdf / transition_width))
+
 
 # Try to import rembg for smart background removal
 try:
@@ -57,6 +179,12 @@ def generate_relief_cookie_cutter(
     Returns:
         Tuple of (output_path, preview_image, stats_dict)
     """
+    # Remember original size BEFORE upscaling for adaptive smoothing
+    orig_h, orig_w = image.shape[:2]
+
+    # Upscale small images using DNN super-resolution before processing
+    image = upscale_image(image, target_min_size=1024)
+
     # Convert to grayscale
     if len(image.shape) == 3:
         if image.shape[2] == 4:
@@ -70,13 +198,23 @@ def generate_relief_cookie_cutter(
         gray = image.copy()
 
     # Resize to resolution
-    gray = cv2.resize(gray, (resolution, resolution), interpolation=cv2.INTER_AREA)
+    h_cur, w_cur = gray.shape[:2]
+    if resolution * resolution < h_cur * w_cur:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_LANCZOS4
+    gray = cv2.resize(gray, (resolution, resolution), interpolation=interp)
 
     # Normalize to 0-1
     heightmap = gray.astype(float) / 255.0
 
     if invert_relief:
         heightmap = 1.0 - heightmap
+
+    # For binary/silhouette images, vectorize for smooth edges
+    near_binary = ((heightmap < 0.1) | (heightmap > 0.9)).sum() / heightmap.size
+    if near_binary > 0.85:
+        heightmap = _vectorize_heightmap(heightmap, smoothing=1.0)
 
     # Create circular mask
     y, x = np.ogrid[:resolution, :resolution]
@@ -254,6 +392,12 @@ def generate_cylinder_seal(
     Returns:
         Tuple of (output_path, preview_image, stats_dict)
     """
+    # Remember original size BEFORE upscaling for adaptive smoothing
+    orig_h, orig_w = image.shape[:2]
+
+    # Upscale small images using DNN super-resolution before processing
+    image = upscale_image(image, target_min_size=1024)
+
     # Convert to grayscale
     if len(image.shape) == 3:
         if image.shape[2] == 4:
@@ -273,7 +417,13 @@ def generate_cylinder_seal(
     target_rows = max(target_rows, 50)  # Minimum height resolution
 
     # Resize image to match cylinder proportions
-    gray = cv2.resize(gray, (target_cols, target_rows), interpolation=cv2.INTER_AREA)
+    # Use INTER_AREA for downscaling, INTER_LANCZOS4 for upscaling
+    h_cur, w_cur = gray.shape[:2]
+    if target_cols * target_rows < h_cur * w_cur:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_LANCZOS4
+    gray = cv2.resize(gray, (target_cols, target_rows), interpolation=interp)
 
     # Normalize to 0-1
     heightmap = gray.astype(float) / 255.0
@@ -281,8 +431,13 @@ def generate_cylinder_seal(
     if invert:
         heightmap = 1.0 - heightmap
 
-    # Apply smoothing
-    if smoothing > 0:
+    # For binary/silhouette images, vectorize: extract contours, smooth
+    # with splines, and re-rasterize with supersampled anti-aliasing.
+    # For photographic images, use standard Gaussian smoothing.
+    near_binary = ((heightmap < 0.1) | (heightmap > 0.9)).sum() / heightmap.size
+    if near_binary > 0.85:
+        heightmap = _vectorize_heightmap(heightmap, smoothing=smoothing)
+    elif smoothing > 0:
         heightmap = gaussian_filter(heightmap, sigma=smoothing)
 
     rows, cols = heightmap.shape
@@ -326,23 +481,23 @@ def generate_cylinder_seal(
         for c in range(cols):
             c_next = (c + 1) % cols
 
-            # Outer surface (CCW winding for outward normals)
+            # Outer surface (CCW winding from outside for outward normals)
             p1 = indices[r, c]
             p2 = indices[r + 1, c]
             p3 = indices[r, c_next]
             p4 = indices[r + 1, c_next]
 
-            faces.append([p1, p2, p3])
-            faces.append([p3, p2, p4])
+            faces.append([p1, p3, p2])
+            faces.append([p3, p4, p2])
 
-            # Inner surface (CW winding for inward normals)
+            # Inner surface (CCW winding from inside for inward normals)
             i1 = p1 + offset
             i2 = p2 + offset
             i3 = p3 + offset
             i4 = p4 + offset
 
-            faces.append([i1, i3, i2])
-            faces.append([i3, i4, i2])
+            faces.append([i1, i2, i3])
+            faces.append([i3, i2, i4])
 
     # Stitch top and bottom rims to make watertight
     for c in range(cols):
@@ -354,8 +509,8 @@ def generate_cylinder_seal(
         i1 = o1 + offset
         i2 = o2 + offset
 
-        faces.append([o1, o2, i1])
-        faces.append([o2, i2, i1])
+        faces.append([o1, i1, o2])
+        faces.append([o2, i1, i2])
 
         # Bottom rim (row rows-1)
         o3 = indices[rows-1, c]
@@ -363,8 +518,8 @@ def generate_cylinder_seal(
         i3 = o3 + offset
         i4 = o4 + offset
 
-        faces.append([o3, i3, o4])
-        faces.append([o4, i3, i4])
+        faces.append([o3, o4, i3])
+        faces.append([o4, i4, i3])
 
     faces = np.array(faces, dtype=np.uint32)
 
@@ -633,7 +788,11 @@ def load_and_preprocess(image: np.ndarray, target_size: int = 200,
     h, w = mask.shape
     scale = target_size / max(h, w)
     new_w, new_h = int(w * scale), int(h * scale)
-    mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if new_w * new_h < w * h:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_LANCZOS4
+    mask = cv2.resize(mask, (new_w, new_h), interpolation=interp)
 
     # Clean up the mask
     kernel = np.ones((3, 3), np.uint8)
@@ -796,99 +955,24 @@ def write_stl(filename: str, vertices: np.ndarray, faces: np.ndarray) -> None:
             f.write(np.uint16(0).tobytes())
 
 
+
 def write_glb(filename: str, vertices: np.ndarray, faces: np.ndarray) -> None:
-    """Write GLB file (binary glTF) for 3D viewing."""
-    import struct
-    import json
+    """Write GLB file via trimesh for reliable 3D viewing."""
+    import trimesh
 
-    # Prepare vertex data (positions only)
-    positions = vertices.astype(np.float32)
-    indices = faces.astype(np.uint32).flatten()
+    mesh = trimesh.Trimesh(
+        vertices=vertices.astype(np.float32),
+        faces=faces.astype(np.int64),
+    )
+    mesh.fix_normals()
 
-    # Calculate bounds
-    pos_min = positions.min(axis=0).tolist()
-    pos_max = positions.max(axis=0).tolist()
+    # Clay/terracotta color so displacement relief is visible
+    mesh.visual = trimesh.visual.ColorVisuals(
+        mesh=mesh,
+        face_colors=np.tile([210, 160, 120, 255], (len(faces), 1))
+    )
 
-    # Create buffer data
-    pos_bytes = positions.tobytes()
-    idx_bytes = indices.tobytes()
-
-    # Padding for alignment
-    pos_padding = (4 - len(pos_bytes) % 4) % 4
-    idx_padding = (4 - len(idx_bytes) % 4) % 4
-
-    buffer_data = idx_bytes + b'\x00' * idx_padding + pos_bytes + b'\x00' * pos_padding
-
-    # glTF JSON
-    gltf = {
-        "asset": {"version": "2.0", "generator": "Cookie Cutter Maker"},
-        "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0}],
-        "meshes": [{
-            "primitives": [{
-                "attributes": {"POSITION": 1},
-                "indices": 0,
-                "mode": 4
-            }]
-        }],
-        "accessors": [
-            {
-                "bufferView": 0,
-                "componentType": 5125,  # UNSIGNED_INT
-                "count": len(indices),
-                "type": "SCALAR"
-            },
-            {
-                "bufferView": 1,
-                "componentType": 5126,  # FLOAT
-                "count": len(positions),
-                "type": "VEC3",
-                "min": pos_min,
-                "max": pos_max
-            }
-        ],
-        "bufferViews": [
-            {
-                "buffer": 0,
-                "byteOffset": 0,
-                "byteLength": len(idx_bytes),
-                "target": 34963  # ELEMENT_ARRAY_BUFFER
-            },
-            {
-                "buffer": 0,
-                "byteOffset": len(idx_bytes) + idx_padding,
-                "byteLength": len(pos_bytes),
-                "target": 34962  # ARRAY_BUFFER
-            }
-        ],
-        "buffers": [{"byteLength": len(buffer_data)}]
-    }
-
-    # Encode JSON
-    json_str = json.dumps(gltf, separators=(',', ':'))
-    json_bytes = json_str.encode('utf-8')
-    json_padding = (4 - len(json_bytes) % 4) % 4
-    json_bytes += b' ' * json_padding
-
-    # GLB structure
-    glb_length = 12 + 8 + len(json_bytes) + 8 + len(buffer_data)
-
-    with open(filename, 'wb') as f:
-        # Header
-        f.write(b'glTF')  # magic
-        f.write(struct.pack('<I', 2))  # version
-        f.write(struct.pack('<I', glb_length))  # length
-
-        # JSON chunk
-        f.write(struct.pack('<I', len(json_bytes)))
-        f.write(b'JSON')
-        f.write(json_bytes)
-
-        # BIN chunk
-        f.write(struct.pack('<I', len(buffer_data)))
-        f.write(b'BIN\x00')
-        f.write(buffer_data)
+    mesh.export(filename, file_type='glb')
 
 
 def create_contour_preview(contour: np.ndarray, outer_contour: np.ndarray,
